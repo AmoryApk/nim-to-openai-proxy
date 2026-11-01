@@ -25,7 +25,7 @@ const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 // Verbose logging: reasoning payload per fallback attempt, full request/error bodies on failure.
 const DEBUG_MODE = process.env.DEBUG_MODE === 'true';
 
-const MAX_TOKENS_LIMIT = 165536;
+const MAX_TOKENS_LIMIT = 665536;
 
 // Shared keep-alive agent for connection reuse on long-lived deployments.
 const keepAliveAgent = new https.Agent({
