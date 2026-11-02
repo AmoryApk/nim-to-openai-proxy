@@ -42,8 +42,11 @@ const nim = axios.create({
 // Per-attempt timeout before falling back to the next model. Reasoning
 // models get a longer window since thinking delays first-token latency.
 // Check these against your platform's own request duration limit.
-const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 180000;
-const REASONING_REQUEST_TIMEOUT_MS = Number(process.env.REASONING_REQUEST_TIMEOUT_MS) || 480000;
+// Keep the proxy response below Vercel's 300-second execution ceiling.
+// The overall budget includes all fallback attempts, not just one upstream call.
+const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 120000;
+const REASONING_REQUEST_TIMEOUT_MS = Number(process.env.REASONING_REQUEST_TIMEOUT_MS) || 240000;
+const PROXY_REQUEST_BUDGET_MS = Number(process.env.PROXY_REQUEST_BUDGET_MS) || 270000;
 const VALIDATION_TIMEOUT_MS = 15000;
 const MAX_BUFFER_SIZE = 1024 * 1024; // 1MB
 
@@ -283,7 +286,8 @@ function setCooldown(model, ms) {
 
 async function callWithFallback(baseRequest, models, enableThinking, clientReasoningEffort, hasTools) {
   let lastError = null;
-  const timeoutMs = resolveEffectiveThinking(enableThinking, clientReasoningEffort)
+  const deadline = Date.now() + PROXY_REQUEST_BUDGET_MS;
+  const configuredTimeoutMs = resolveEffectiveThinking(enableThinking, clientReasoningEffort)
     ? REASONING_REQUEST_TIMEOUT_MS
     : REQUEST_TIMEOUT_MS;
 
@@ -292,11 +296,18 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
   const attemptOrder = activeModels.length > 0 ? activeModels : models;
 
   for (const model of attemptOrder) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      lastError = new Error('Proxy request budget exhausted before fallback completed');
+      break;
+    }
+
+    const timeoutMs = Math.min(configuredTimeoutMs, remainingMs);
     const reasoningPayload = getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTools);
     const fullRequest = { ...baseRequest, model, ...reasoningPayload };
 
     if (DEBUG_MODE) {
-      console.log(`[DEBUG] Attempting ${model} with reasoning payload:`, JSON.stringify(reasoningPayload), `(timeout: ${timeoutMs}ms)`);
+      console.log(`[DEBUG] Attempting ${model} with reasoning payload:`, JSON.stringify(reasoningPayload), `(timeout: ${timeoutMs}ms, remaining budget: ${remainingMs}ms)`);
     }
 
     try {
