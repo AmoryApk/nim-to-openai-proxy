@@ -4,7 +4,9 @@
 // text from responses that embed it inline vs. as a structured field.
 
 const SHOW_REASONING = process.env.SHOW_REASONING === 'true';
-if (SHOW_REASONING) console.log('[CONFIG] Reasoning display: ENABLED');
+const THINKING_TAG = process.env.THINKING_TAG || 'think';
+const MIN_REASONING_MAX_TOKENS = Number(process.env.MIN_REASONING_MAX_TOKENS) || 4096;
+if (SHOW_REASONING) console.log(`[CONFIG] Reasoning display: ENABLED (tag: <${THINKING_TAG}>)`);
 
 // Everything returned by getReasoningPayload() is spread into the top-level
 // JSON body sent to NIM. Do not wrap it in `extra_body` — that's an
@@ -157,8 +159,14 @@ const REASONING_EFFORT_ENUMS = {
   'openai/gpt-oss-20b': ['low', 'medium', 'high'],
   'deepseek-ai/deepseek-v4-flash-0731': ['low', 'high', 'max'],
   'deepseek-ai/deepseek-v4-pro-0813': ['low', 'high', 'max'],
+  'deepseek-ai/deepseek-v4.1-flash': ['low', 'high', 'max'],
+  'deepseek-ai/deepseek-r1': ['low', 'medium', 'high', 'max'],
+  'z-ai/glm-5.3': ['low', 'medium', 'high'],
+  'z-ai/glm-5.3-flash': ['low', 'medium', 'high'],
   'nvidia/nemotron-3-super-120b-a12b': ['low'],
   'nvidia/nemotron-3-ultra-550b-a55b': ['low'],
+  'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning': ['low'],
+  'nvidia/nemotron-3.5-super-vl-120b-a12b': ['low'],
   'minimaxai/minimax-m3': ['adaptive'],
   'moonshotai/kimi-k3': ['low', 'high', 'max'],
   'meta/muse-glimmer-30b': ['none', 'minimal', 'low', 'medium', 'high', 'max']
@@ -199,37 +207,9 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
   const effort = validReasoningEffort(model, rawEffort);
 
   switch (model) {
-    case 'nvidia/nemotron-3-super-120b-a12b': {
-      if (!enableThinking) return {};
-      const payload = { chat_template_kwargs: { enable_thinking: true } };
-      if (effort === 'low') payload.chat_template_kwargs.low_effort = true;
-      return payload;
-    }
-
-    case 'nvidia/nemotron-3-ultra-550b-a55b': {
-      if (!enableThinking) return {};
-      const payload = { chat_template_kwargs: { enable_thinking: true } };
-      if (effort === 'low') payload.chat_template_kwargs.low_effort = true;
-      if (hasTools) payload.chat_template_kwargs.force_nonempty_content = true; // unverified
-      return payload;
-    }
-
     case 'nvidia/nemotron-3.5-lightning-30b-a3b': {
       if (!enableThinking) return { reasoning_budget: 0 };
       return { reasoning_budget: NEMOTRON_LIGHTNING_BUDGET_MAP[effort] ?? 16384 };
-    }
-
-    case 'deepseek-ai/deepseek-v4-flash-0731':
-    case 'deepseek-ai/deepseek-v4-pro-0813': {
-      if (!enableThinking) {
-        return { chat_template_kwargs: { thinking: false } };
-      }
-      return {
-        chat_template_kwargs: {
-          thinking: true,
-          reasoning_effort: effort || 'high'
-        }
-      };
     }
 
     case 'openai/gpt-oss-120b':
@@ -252,10 +232,6 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
       return { reasoning_effort: enableThinking ? 'high' : 'none' };
     }
 
-    // poolside/laguna-xs-2.1: no documented reasoning param on NIM's hosted
-    // endpoint (model, messages, temperature, top_p, max_tokens, stream
-    // only). Falls through to default.
-
     case 'minimaxai/minimax-m3': {
       const thinkingMode = effort === 'adaptive'
         ? 'adaptive'
@@ -269,13 +245,48 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
       return { reasoning_effort: enableThinking ? 'high' : 'low' };
     }
 
-    default:
+    default: {
+      // Family pattern matching for models not explicitly matched above
+      if (model.includes('deepseek')) {
+        if (!enableThinking) {
+          return { chat_template_kwargs: { thinking: false } };
+        }
+        return {
+          chat_template_kwargs: {
+            thinking: true,
+            reasoning_effort: effort || 'high'
+          }
+        };
+      }
+
+      if (model.includes('glm')) {
+        if (!enableThinking) {
+          return { chat_template_kwargs: { thinking: false } };
+        }
+        return {
+          chat_template_kwargs: {
+            thinking: true
+          }
+        };
+      }
+
+      if (model.includes('nemotron') && (model.includes('super') || model.includes('ultra') || model.includes('reasoning') || model.includes('nano'))) {
+        if (!enableThinking) return {};
+        const payload = { chat_template_kwargs: { enable_thinking: true } };
+        if (effort === 'low') payload.chat_template_kwargs.low_effort = true;
+        if (hasTools && model.includes('ultra')) payload.chat_template_kwargs.force_nonempty_content = true;
+        return payload;
+      }
+
       return {};
+    }
   }
 }
 
 module.exports = {
   SHOW_REASONING,
+  THINKING_TAG,
+  MIN_REASONING_MAX_TOKENS,
   getReasoningPayload,
   resolveEffectiveThinking,
   StreamNormalizer,

@@ -7,7 +7,7 @@ const axios = require('axios');
 const https = require('https');
 const { StringDecoder } = require('string_decoder');
 const { timingSafeEqual } = require('crypto');
-const { SHOW_REASONING, getReasoningPayload, resolveEffectiveThinking, StreamNormalizer, normalizeNonStreamChoice } = require('./reasoning');
+const { SHOW_REASONING, THINKING_TAG, MIN_REASONING_MAX_TOKENS, getReasoningPayload, resolveEffectiveThinking, StreamNormalizer, normalizeNonStreamChoice } = require('./reasoning');
 const { extractLeakedToolCalls, ToolCallStreamRecovery } = require('./tools');
 
 const app = express();
@@ -26,12 +26,17 @@ const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 const DEBUG_MODE = process.env.DEBUG_MODE === 'true';
 
 const MAX_TOKENS_LIMIT = 665536;
+const DEFAULT_MAX_TOKENS = Number(process.env.DEFAULT_MAX_TOKENS) || 4096;
+const MIN_MAX_TOKENS = Number(process.env.MIN_MAX_TOKENS) || 3072;
+const FORCE_MAX_TOKENS = process.env.FORCE_MAX_TOKENS ? Number(process.env.FORCE_MAX_TOKENS) : null;
+const AUTO_PREVENT_TRUNCATION = process.env.AUTO_PREVENT_TRUNCATION !== 'false';
 
 // Shared keep-alive agent for connection reuse on long-lived deployments.
 const keepAliveAgent = new https.Agent({
   keepAlive: true,
   maxSockets: 50,
-  maxFreeSockets: 10
+  maxFreeSockets: 10,
+  timeout: REASONING_REQUEST_TIMEOUT_MS + 60000
 });
 
 const nim = axios.create({
@@ -281,7 +286,7 @@ function setCooldown(model, ms) {
   modelCooldowns.set(model, Date.now() + ms);
 }
 
-async function callWithFallback(baseRequest, models, enableThinking, clientReasoningEffort, hasTools) {
+async function callWithFallback(baseRequest, models, enableThinking, clientReasoningEffort, hasTools, abortSignal) {
   let lastError = null;
   const timeoutMs = resolveEffectiveThinking(enableThinking, clientReasoningEffort)
     ? REASONING_REQUEST_TIMEOUT_MS
@@ -292,6 +297,11 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
   const attemptOrder = activeModels.length > 0 ? activeModels : models;
 
   for (const model of attemptOrder) {
+    if (abortSignal?.aborted) {
+      console.log('[PROXY] Request aborted before attempting model:', model);
+      throw new Error('Request aborted by client');
+    }
+
     const reasoningPayload = getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTools);
     const fullRequest = { ...baseRequest, model, ...reasoningPayload };
 
@@ -309,13 +319,19 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
             'Content-Type': 'application/json'
           },
           responseType: baseRequest.stream ? 'stream' : 'json',
-          timeout: timeoutMs
+          timeout: timeoutMs,
+          signal: abortSignal
         }
       );
       return { response: res, model };
     } catch (err) {
       lastError = err;
       const status = err.response?.status;
+
+      if (axios.isCancel(err) || err.name === 'CanceledError' || abortSignal?.aborted) {
+        console.log('[PROXY] Request aborted by client, terminating fallback chain');
+        throw err;
+      }
 
       console.warn(
         `[FALLBACK] Model failed: ${model}`,
@@ -443,6 +459,12 @@ app.get('/v1/models', async (req, res) => {
 });
 
 app.post('/v1/chat/completions', async (req, res) => {
+  if (req.socket) {
+    req.socket.setKeepAlive(true, 10000);
+    req.socket.setTimeout(REASONING_REQUEST_TIMEOUT_MS + 60000);
+  }
+
+  const abortController = new AbortController();
   let streamEndedCleanly = false;
   let upstreamStream = null;
 
@@ -451,8 +473,12 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     let primaryModel = MODEL_MAPPING[model];
     if (!primaryModel) {
-      console.warn(`[PROXY] Unknown model alias "${model}", falling back to default: ${DEFAULT_MODEL}`);
-      primaryModel = DEFAULT_MODEL;
+      if (model && model.includes('/')) {
+        primaryModel = model;
+      } else {
+        console.warn(`[PROXY] Unknown model alias "${model}", falling back to default: ${DEFAULT_MODEL}`);
+        primaryModel = DEFAULT_MODEL;
+      }
     }
 
     // De-dupe: avoids retrying the same model twice if it's also in FALLBACK_MODELS.
@@ -462,42 +488,106 @@ app.post('/v1/chat/completions', async (req, res) => {
     // reasoning_effort (translated per-model by getReasoningPayload).
     const { model: _droppedModel, reasoning_effort: _droppedReasoningEffort, ...forwardedFields } = req.body;
 
+    const isThinking = resolveEffectiveThinking(ENABLE_THINKING_MODE, reasoning_effort);
+    let effectiveMaxTokens;
+
+    if (FORCE_MAX_TOKENS && FORCE_MAX_TOKENS > 0) {
+      effectiveMaxTokens = Math.min(FORCE_MAX_TOKENS, MAX_TOKENS_LIMIT);
+    } else {
+      const clientRequested = (typeof max_tokens === 'number' && max_tokens > 0) ? max_tokens : null;
+
+      if (!clientRequested) {
+        // Client sent 0, null, or undefined (e.g. Janitor AI '0' setting) -> give full generous headroom
+        effectiveMaxTokens = DEFAULT_MAX_TOKENS;
+      } else if (AUTO_PREVENT_TRUNCATION) {
+        // Prevent Janitor AI's low slider values (e.g. 200, 300, 500) from truncating the bot mid-sentence
+        effectiveMaxTokens = Math.max(clientRequested, MIN_MAX_TOKENS);
+      } else {
+        effectiveMaxTokens = clientRequested;
+      }
+
+      // If reasoning/thinking is enabled, add buffer so thinking tokens never choke out the final reply
+      if (isThinking) {
+        effectiveMaxTokens = Math.max(effectiveMaxTokens, MIN_REASONING_MAX_TOKENS, clientRequested ? clientRequested + 2048 : DEFAULT_MAX_TOKENS);
+      }
+
+      effectiveMaxTokens = Math.min(effectiveMaxTokens, MAX_TOKENS_LIMIT);
+    }
+
+    if (effectiveMaxTokens !== max_tokens) {
+      console.log(`[PROXY] Max tokens adjusted: client requested ${max_tokens ?? 'none/0'}, allocated ${effectiveMaxTokens} to prevent mid-sentence cutoff`);
+    }
+
     const baseRequest = {
       ...forwardedFields,
       temperature: temperature ?? 0.7,
-      max_tokens: Math.min(max_tokens ?? 2048, MAX_TOKENS_LIMIT),
+      max_tokens: effectiveMaxTokens,
       stream: stream || false
     };
 
-    const { response, model: usedModel } = await callWithFallback(
-      baseRequest,
-      modelChain,
-      ENABLE_THINKING_MODE,
-      reasoning_effort,
-      !!req.body.tools
-    );
-
-    upstreamStream = response.data;
-    console.log('[PROXY] Model used:', usedModel);
-
-    const inlineReasoning = req.headers['x-reasoning-format'] === 'inline';
+    const inlineReasoning = req.headers['x-reasoning-format'] === 'inline' ||
+      (SHOW_REASONING && req.headers['x-reasoning-format'] !== 'structured');
 
     if (stream) {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
+      res.status(200);
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
       res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      if (typeof res.flushHeaders === 'function') {
+        res.flushHeaders();
+      }
+
+      const keepAliveInterval = setInterval(() => {
+        safeWrite(res, ': keep-alive\n\n');
+      }, 15000);
+
+      let response, usedModel;
+      try {
+        const result = await callWithFallback(
+          baseRequest,
+          modelChain,
+          ENABLE_THINKING_MODE,
+          reasoning_effort,
+          !!req.body.tools,
+          abortController.signal
+        );
+        response = result.response;
+        usedModel = result.model;
+      } catch (err) {
+        clearInterval(keepAliveInterval);
+        if (abortController.signal.aborted) {
+          return;
+        }
+        console.error('[PROXY] Fallback chain failed:', err.message);
+        safeWrite(res, `data: ${JSON.stringify({
+          error: {
+            message: err.response?.data?.error?.message || err.message || 'All models failed',
+            type: 'proxy_error',
+            code: err.response?.status || 500
+          }
+        })}\n\n`);
+        safeWrite(res, 'data: [DONE]\n\n');
+        res.end();
+        return;
+      }
+
+      upstreamStream = response.data;
+      console.log('[PROXY] Model used:', usedModel);
 
       const decoder = new StringDecoder('utf8');
       let buffer = '';
       let reasoningOpen = false;
       let doneSent = false;
       let cleanedUp = false;
+      let totalContentSent = 0;
       const normalizer = new StreamNormalizer(usedModel);
       const toolRecovery = new ToolCallStreamRecovery();
 
       const cleanup = () => {
         if (cleanedUp) return;
         cleanedUp = true;
+        clearInterval(keepAliveInterval);
         if (upstreamStream) {
           upstreamStream.removeAllListeners();
         }
@@ -528,14 +618,14 @@ app.post('/v1/chat/completions', async (req, res) => {
 
             if (SHOW_REASONING && inlineReasoning) {
               if (normalizedDelta.reasoning && !reasoningOpen) {
-                clientContent += `<thinking>\n${normalizedDelta.reasoning}`;
+                clientContent += `<${THINKING_TAG}>\n${normalizedDelta.reasoning}`;
                 reasoningOpen = true;
               } else if (normalizedDelta.reasoning) {
                 clientContent += normalizedDelta.reasoning;
               }
 
               if (normalizedDelta.content && reasoningOpen) {
-                clientContent += `\n</thinking>\n\n${normalizedDelta.content}`;
+                clientContent += `\n</${THINKING_TAG}>\n\n${normalizedDelta.content}`;
                 reasoningOpen = false;
               } else if (normalizedDelta.content) {
                 clientContent += normalizedDelta.content;
@@ -552,6 +642,9 @@ app.post('/v1/chat/completions', async (req, res) => {
             }
 
             delta.content = clientContent;
+            if (clientContent) {
+              totalContentSent += clientContent.length;
+            }
 
             if (SHOW_REASONING && normalizedDelta.reasoning) {
               delta.reasoning = normalizedDelta.reasoning;
@@ -601,6 +694,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       });
 
       upstreamStream.on('end', () => {
+        clearInterval(keepAliveInterval);
         buffer += decoder.end();
         if (buffer.trim()) {
           for (const line of buffer.split('\n')) {
@@ -621,14 +715,14 @@ app.post('/v1/chat/completions', async (req, res) => {
 
           if (SHOW_REASONING && inlineReasoning) {
             if (flushedDelta.reasoning && !reasoningOpen) {
-              clientContent += `<thinking>\n${flushedDelta.reasoning}`;
+              clientContent += `<${THINKING_TAG}>\n${flushedDelta.reasoning}`;
               reasoningOpen = true;
             } else if (flushedDelta.reasoning) {
               clientContent += flushedDelta.reasoning;
             }
 
             if (flushedDelta.content && reasoningOpen) {
-              clientContent += `\n</thinking>\n\n${flushedDelta.content}`;
+              clientContent += `\n</${THINKING_TAG}>\n\n${flushedDelta.content}`;
               reasoningOpen = false;
             } else if (flushedDelta.content) {
               clientContent += flushedDelta.content;
@@ -638,7 +732,10 @@ app.post('/v1/chat/completions', async (req, res) => {
           }
 
           const finalChunk = { choices: [{ delta: {} }] };
-          if (clientContent) finalChunk.choices[0].delta.content = clientContent;
+          if (clientContent) {
+            finalChunk.choices[0].delta.content = clientContent;
+            totalContentSent += clientContent.length;
+          }
 
           if (SHOW_REASONING && !inlineReasoning && flushedDelta.reasoning) {
             finalChunk.choices[0].delta.reasoning = flushedDelta.reasoning;
@@ -650,14 +747,22 @@ app.post('/v1/chat/completions', async (req, res) => {
           }
         }
 
-        // Close an inline <thinking> tag left open if the model was cut off mid-reasoning.
+        // Close an inline thinking tag left open if the model was cut off mid-reasoning.
         if (SHOW_REASONING && inlineReasoning && reasoningOpen) {
-          safeWrite(res, `data: ${JSON.stringify({ choices: [{ delta: { content: '\n</thinking>\n' } }] })}\n\n`);
+          safeWrite(res, `data: ${JSON.stringify({ choices: [{ delta: { content: `\n</${THINKING_TAG}>\n\n` } }] })}\n\n`);
           reasoningOpen = false;
+        }
+
+        // Fallback: If no visible content was ever sent across the entire stream,
+        // send a helpful message so Janitor AI doesn't report "No response from bot (pgshag2)".
+        if (totalContentSent === 0) {
+          const fallbackText = "(No content returned by model. The prompt may have triggered an upstream filter or token limit.)";
+          safeWrite(res, `data: ${JSON.stringify({ choices: [{ delta: { content: fallbackText } }] })}\n\n`);
         }
 
         if (!doneSent) {
           safeWrite(res, 'data: [DONE]\n\n');
+          doneSent = true;
         }
         streamEndedCleanly = true;
         if (!res.writableEnded) {
@@ -668,6 +773,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       upstreamStream.on('error', err => {
         console.error('[STREAM] Upstream error:', err.message);
+        clearInterval(keepAliveInterval);
         if (!res.writableEnded) {
           safeWrite(res, `data: ${JSON.stringify({
             error: {
@@ -686,12 +792,25 @@ app.post('/v1/chat/completions', async (req, res) => {
         if (!streamEndedCleanly && clientGone) {
           console.warn('[STREAM] Client disconnected prematurely');
         }
+        clearInterval(keepAliveInterval);
+        abortController.abort();
         if (upstreamStream && !upstreamStream.destroyed && !streamEndedCleanly) {
           upstreamStream.destroy();
         }
         cleanup();
       });
     } else {
+      const { response, model: usedModel } = await callWithFallback(
+        baseRequest,
+        modelChain,
+        ENABLE_THINKING_MODE,
+        reasoning_effort,
+        !!req.body.tools,
+        abortController.signal
+      );
+
+      console.log('[PROXY] Model used:', usedModel);
+
       const openaiResponse = {
         id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
@@ -706,7 +825,16 @@ app.post('/v1/chat/completions', async (req, res) => {
           content = cleanedContent;
 
           if (SHOW_REASONING && inlineReasoning && reasoning) {
-            content = `<thinking>\n${reasoning}\n</thinking>\n\n${content}`;
+            content = `<${THINKING_TAG}>\n${reasoning}\n</${THINKING_TAG}>\n\n${content}`;
+          }
+
+          // Fallback: If content is empty but reasoning exists, provide reasoning inside tags
+          if ((!content || !content.trim()) && reasoning) {
+            content = `<${THINKING_TAG}>\n${reasoning}\n</${THINKING_TAG}>`;
+          } else if (!content || !content.trim()) {
+            if (recoveredToolCalls.length === 0) {
+              content = "(No response content returned by model. The prompt may have triggered an upstream filter or token limit.)";
+            }
           }
 
           const finalMessage = { ...normalizedChoice.message, content };
@@ -791,10 +919,16 @@ app.use((req, res) => {
 
 // ─── Startup ──────────────────────────────────────────────────────────────
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`[PROXY] Hybrid proxy running on port ${PORT}`);
   console.log(`[PROXY] Max tokens limit: ${MAX_TOKENS_LIMIT}`);
   validateModels().catch(err => {
     console.error('[VALIDATION] Startup check failed:', err.message);
   });
 });
+
+// Configure server timeouts to prevent premature disconnection during deep thinking
+server.keepAliveTimeout = 65000;
+server.headersTimeout = Math.max(70000, REASONING_REQUEST_TIMEOUT_MS + 60000);
+server.requestTimeout = Math.max(300000, REASONING_REQUEST_TIMEOUT_MS + 60000);
+server.timeout = Math.max(300000, REASONING_REQUEST_TIMEOUT_MS + 60000);

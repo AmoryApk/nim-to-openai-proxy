@@ -95,15 +95,21 @@ The client never sees your NVAPI key, which is why we don't use it as the auth, 
 
 ### Optional Environment Variables
 
-After deploying, you can set these in Railway's **Variables** tab (reasoning does not reliably work):
+After deploying, you can set these in Railway's **Variables** tab:
 
 | Variable | Value | Effect |
 |---|---|---|
-| `SHOW_REASONING` | `true` | Shows model reasoning in `<thinking>` tags |
+| `SHOW_REASONING` | `true` | Shows model reasoning in collapsible `<think>` tags (compatible with Janitor AI's Think Box) |
 | `ENABLE_THINKING_MODE` | `true` | Sends thinking parameters to supported models |
+| `THINKING_TAG` | `think` (default) or `thinking` | Customizes thinking tag wrapper (`<think>` or `<thinking>`) |
+| `MIN_MAX_TOKENS` | `3072` (default) | Minimum token limit guaranteed to the bot so it doesn't get cut off mid-sentence |
+| `DEFAULT_MAX_TOKENS` | `4096` (default) | Default tokens used if Janitor AI sends 0 or no limit |
+| `FORCE_MAX_TOKENS` | e.g. `4096` or `8192` | Forces all requests to use this token limit, ignoring low client sliders |
+| `AUTO_PREVENT_TRUNCATION`| `true` (default) | Automatically prevents low client sliders from cutting off replies mid-sentence |
+| `MIN_REASONING_MAX_TOKENS` | `4096` (default) | Ensures thinking models have ample tokens for both thinking and the final reply |
 | `DISCORD_WEBHOOK_URL` | Webhook URL | Alerts you when models fail validation |
 | `SKIP_VALIDATION` | `true` | Disables startup model checks |
-| `DEBUG_MODE` | `true` | Allows you to debug everything going on. |
+| `DEBUG_MODE` | `true` | Allows you to debug everything going on |
 
 Set to `false` or remove to disable. Changes apply without redeploying.
 
@@ -111,6 +117,8 @@ Set to `false` or remove to disable. Changes apply without redeploying.
 
 | Problem | Likely Cause | Fix |
 |---|---|---|
+| "The reply hit the output-token limit. Tap Continue to keep it going." | Janitor AI's Max Tokens slider was set too low (e.g. 200–500 tokens), or thinking ate all available tokens | **Fixed in proxy!** The proxy now automatically allocates a generous floor (3072–4096 tokens) so the bot finishes naturally with `finish_reason: "stop"`. You can also increase your Max Tokens slider in Janitor AI to 2048+ or set `FORCE_MAX_TOKENS=4096`. |
+| "No response from bot (pgshag2)" / Socket hang-up on thinking | Connection timed out during slow thinking, or tokens exhausted during thought | 1. **Turn Streaming ON** in Janitor AI API settings (proxy will send SSE keep-alives so connections never drop).<br>2. Set `SHOW_REASONING=true` in proxy environment.<br>3. Increase `Max Tokens` in Janitor AI to 2048+ so the model doesn't run out of tokens mid-thought. |
 | "All models failed" error | NIM API key invalid or expired | Regenerate key at build.nvidia.com |
 | Very slow responses | Using `gpt-4o`, `gpt-4-turbo`, or other Chinese-hosted models during peak hours | Switch to `gemini-pro`, `mistral-turbo`, `claude-3-opus`, or `gpt-3.5o` |
 | Filter interrupts RP | Using Chinese-hosted model for mature content | Use `mistral`, `gemini-pro`, or `claude-3-opus` |
