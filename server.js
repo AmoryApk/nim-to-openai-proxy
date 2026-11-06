@@ -31,6 +31,14 @@ const MIN_MAX_TOKENS = Number(process.env.MIN_MAX_TOKENS) || 3072;
 const FORCE_MAX_TOKENS = process.env.FORCE_MAX_TOKENS ? Number(process.env.FORCE_MAX_TOKENS) : null;
 const AUTO_PREVENT_TRUNCATION = process.env.AUTO_PREVENT_TRUNCATION !== 'false';
 
+// Per-attempt timeout before falling back to the next model. Reasoning
+// models get a longer window since thinking delays first-token latency.
+// Check these against your platform's own request duration limit.
+const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 180000;
+const REASONING_REQUEST_TIMEOUT_MS = Number(process.env.REASONING_REQUEST_TIMEOUT_MS) || 480000;
+const VALIDATION_TIMEOUT_MS = 15000;
+const MAX_BUFFER_SIZE = 1024 * 1024; // 1MB
+
 // Shared keep-alive agent for connection reuse on long-lived deployments.
 const keepAliveAgent = new https.Agent({
   keepAlive: true,
@@ -43,14 +51,6 @@ const nim = axios.create({
   baseURL: NIM_API_BASE,
   httpsAgent: keepAliveAgent
 });
-
-// Per-attempt timeout before falling back to the next model. Reasoning
-// models get a longer window since thinking delays first-token latency.
-// Check these against your platform's own request duration limit.
-const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 180000;
-const REASONING_REQUEST_TIMEOUT_MS = Number(process.env.REASONING_REQUEST_TIMEOUT_MS) || 480000;
-const VALIDATION_TIMEOUT_MS = 15000;
-const MAX_BUFFER_SIZE = 1024 * 1024; // 1MB
 
 if (ENABLE_THINKING_MODE) console.log('[CONFIG] Thinking mode: ENABLED');
 if (DEBUG_MODE) console.log('[CONFIG] Debug mode: ENABLED (verbose reasoning + fallback logging)');
