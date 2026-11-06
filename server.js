@@ -530,8 +530,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream: stream || false
     };
 
-    const inlineReasoning = req.headers['x-reasoning-format'] === 'inline' ||
-      (SHOW_REASONING && req.headers['x-reasoning-format'] !== 'structured');
+    const inlineReasoning = req.headers['x-reasoning-format'] === 'inline' || process.env.REASONING_FORMAT === 'inline';
 
     if (stream) {
       res.status(200);
@@ -621,42 +620,58 @@ app.post('/v1/chat/completions', async (req, res) => {
             const normalizedDelta = normalizer.processDelta(delta);
             let clientContent = '';
 
-            if (SHOW_REASONING && inlineReasoning) {
-              if (normalizedDelta.reasoning && !reasoningOpen) {
-                clientContent += `<${THINKING_TAG}>\n${normalizedDelta.reasoning}`;
-                reasoningOpen = true;
-              } else if (normalizedDelta.reasoning) {
+            if (inlineReasoning) {
+              if (SHOW_REASONING && normalizedDelta.reasoning) {
+                if (!reasoningOpen) {
+                  clientContent += `<${THINKING_TAG}>\n`;
+                  reasoningOpen = true;
+                }
                 clientContent += normalizedDelta.reasoning;
               }
 
-              if (normalizedDelta.content && reasoningOpen) {
-                clientContent += `\n</${THINKING_TAG}>\n\n${normalizedDelta.content}`;
-                reasoningOpen = false;
-              } else if (normalizedDelta.content) {
+              if (normalizedDelta.content) {
+                if (reasoningOpen) {
+                  clientContent += `\n</${THINKING_TAG}>\n\n`;
+                  reasoningOpen = false;
+                }
                 clientContent += normalizedDelta.content;
               }
-            } else {
-              clientContent = normalizedDelta.content || '';
-            }
 
-            const { content: recoveredContent, toolCallDeltas } = toolRecovery.process(clientContent);
-            clientContent = recoveredContent;
-            if (toolCallDeltas.length > 0) {
-              delta.tool_calls = toolCallDeltas;
-              if (data.choices[0]) data.choices[0].finish_reason = 'tool_calls';
-            }
+              const { content: recoveredContent, toolCallDeltas } = toolRecovery.process(clientContent);
+              clientContent = recoveredContent;
+              if (toolCallDeltas.length > 0) {
+                delta.tool_calls = toolCallDeltas;
+                if (data.choices[0]) data.choices[0].finish_reason = 'tool_calls';
+              }
 
-            delta.content = clientContent;
-            if (clientContent) {
-              totalContentSent += clientContent.length;
-            }
-
-            if (SHOW_REASONING && normalizedDelta.reasoning) {
-              delta.reasoning = normalizedDelta.reasoning;
-              delta.reasoning_content = normalizedDelta.reasoning;
-            } else {
+              delta.content = clientContent;
               delete delta.reasoning;
               delete delta.reasoning_content;
+            } else {
+              // Standard format for Janitor AI and modern OpenAI/DeepSeek clients
+              if (SHOW_REASONING && normalizedDelta.reasoning) {
+                delta.reasoning = normalizedDelta.reasoning;
+                delta.reasoning_content = normalizedDelta.reasoning;
+              } else {
+                delete delta.reasoning;
+                delete delta.reasoning_content;
+              }
+
+              if (normalizedDelta.content) {
+                const { content: recoveredContent, toolCallDeltas } = toolRecovery.process(normalizedDelta.content);
+                clientContent = recoveredContent;
+                if (toolCallDeltas.length > 0) {
+                  delta.tool_calls = toolCallDeltas;
+                  if (data.choices[0]) data.choices[0].finish_reason = 'tool_calls';
+                }
+                delta.content = clientContent;
+              } else {
+                delta.content = '';
+              }
+            }
+
+            if (clientContent) {
+              totalContentSent += clientContent.length;
             }
           }
 
@@ -718,18 +733,20 @@ app.post('/v1/chat/completions', async (req, res) => {
         if (flushedDelta.content || flushedDelta.reasoning) {
           let clientContent = '';
 
-          if (SHOW_REASONING && inlineReasoning) {
-            if (flushedDelta.reasoning && !reasoningOpen) {
-              clientContent += `<${THINKING_TAG}>\n${flushedDelta.reasoning}`;
-              reasoningOpen = true;
-            } else if (flushedDelta.reasoning) {
+          if (inlineReasoning) {
+            if (SHOW_REASONING && flushedDelta.reasoning) {
+              if (!reasoningOpen) {
+                clientContent += `<${THINKING_TAG}>\n`;
+                reasoningOpen = true;
+              }
               clientContent += flushedDelta.reasoning;
             }
 
-            if (flushedDelta.content && reasoningOpen) {
-              clientContent += `\n</${THINKING_TAG}>\n\n${flushedDelta.content}`;
-              reasoningOpen = false;
-            } else if (flushedDelta.content) {
+            if (flushedDelta.content) {
+              if (reasoningOpen) {
+                clientContent += `\n</${THINKING_TAG}>\n\n`;
+                reasoningOpen = false;
+              }
               clientContent += flushedDelta.content;
             }
           } else {
@@ -829,16 +846,15 @@ app.post('/v1/chat/completions', async (req, res) => {
           const { content: cleanedContent, toolCalls: recoveredToolCalls } = extractLeakedToolCalls(content);
           content = cleanedContent;
 
-          if (SHOW_REASONING && inlineReasoning && reasoning) {
+          if (inlineReasoning && SHOW_REASONING && reasoning) {
             content = `<${THINKING_TAG}>\n${reasoning}\n</${THINKING_TAG}>\n\n${content}`;
           }
 
-          // Fallback: If content is empty but reasoning exists, provide reasoning inside tags
-          if ((!content || !content.trim()) && reasoning) {
-            content = `<${THINKING_TAG}>\n${reasoning}\n</${THINKING_TAG}>`;
-          } else if (!content || !content.trim()) {
+          if (!content || !content.trim()) {
             if (recoveredToolCalls.length === 0) {
-              content = "(No response content returned by model. The prompt may have triggered an upstream filter or token limit.)";
+              content = reasoning && !inlineReasoning
+                ? "*(The model finished its thought process. Tap Continue to generate the response.)*"
+                : "(No response content returned by model. The prompt may have triggered an upstream filter or token limit.)";
             }
           }
 
@@ -855,7 +871,7 @@ app.post('/v1/chat/completions', async (req, res) => {
             }
           }
 
-          if (SHOW_REASONING && reasoning) {
+          if (SHOW_REASONING && reasoning && !inlineReasoning) {
             finalMessage.reasoning = reasoning;
             finalMessage.reasoning_content = reasoning;
           } else {

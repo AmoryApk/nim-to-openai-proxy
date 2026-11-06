@@ -16,18 +16,20 @@ if (SHOW_REASONING) console.log(`[CONFIG] Reasoning display: ENABLED (tag: <${TH
 // structured `reasoning`/`reasoning_content` field. Clients that want
 // legacy inline <thinking> tags can opt in via `x-reasoning-format: inline`.
 
-// Models that embed reasoning inline in `content` via delimiter tags instead
-// of a structured field.
-const CONTENT_DELIMITER_TAGS = {
-  'minimaxai/minimax-m3': ['<mm:think>', '</mm:think>']
-};
+// Models may embed reasoning inline in `content` via delimiter tags instead
+// of a structured field. We support all known tags (<think>, <thought>, <mm:think>).
+const KNOWN_THINK_TAG_PAIRS = [
+  ['<think>', '</think>'],
+  ['<thought>', '</thought>'],
+  ['<mm:think>', '</mm:think>']
+];
 
 // Stateful parser for extracting reasoning blocks across streamed chunks.
-class DelimiterParser {
-  constructor(openTag, closeTag) {
-    this.openTag = openTag;
-    this.closeTag = closeTag;
+class MultiDelimiterParser {
+  constructor(tagPairs = KNOWN_THINK_TAG_PAIRS) {
+    this.tagPairs = tagPairs;
     this.inThinking = false;
+    this.currentCloseTag = '</think>';
     this.buffer = '';
   }
 
@@ -37,33 +39,61 @@ class DelimiterParser {
     let reasoning = '';
 
     while (true) {
-      const targetTag = this.inThinking ? this.closeTag : this.openTag;
-      const tagIndex = this.buffer.indexOf(targetTag);
+      if (!this.inThinking) {
+        let earliestIdx = -1;
+        let matchedPair = null;
 
-      if (tagIndex !== -1) {
-        const textBefore = this.buffer.substring(0, tagIndex);
-        if (this.inThinking) {
-          reasoning += textBefore;
-        } else {
-          content += textBefore;
+        for (const pair of this.tagPairs) {
+          const idx = this.buffer.indexOf(pair[0]);
+          if (idx !== -1 && (earliestIdx === -1 || idx < earliestIdx)) {
+            earliestIdx = idx;
+            matchedPair = pair;
+          }
         }
-        this.inThinking = !this.inThinking;
-        this.buffer = this.buffer.substring(tagIndex + targetTag.length);
-      } else {
+
+        if (earliestIdx !== -1) {
+          content += this.buffer.substring(0, earliestIdx);
+          this.inThinking = true;
+          this.currentCloseTag = matchedPair[1];
+          this.buffer = this.buffer.substring(earliestIdx + matchedPair[0].length);
+          continue;
+        }
+
         let partialLen = 0;
-        const maxLen = Math.min(this.buffer.length, targetTag.length - 1);
+        for (const pair of this.tagPairs) {
+          const openTag = pair[0];
+          const maxLen = Math.min(this.buffer.length, openTag.length - 1);
+          for (let i = maxLen; i > 0; i--) {
+            if (openTag.startsWith(this.buffer.substring(this.buffer.length - i))) {
+              if (i > partialLen) partialLen = i;
+              break;
+            }
+          }
+        }
+
+        content += this.buffer.substring(0, this.buffer.length - partialLen);
+        this.buffer = this.buffer.substring(this.buffer.length - partialLen);
+        break;
+      } else {
+        const closeIdx = this.buffer.indexOf(this.currentCloseTag);
+
+        if (closeIdx !== -1) {
+          reasoning += this.buffer.substring(0, closeIdx);
+          this.inThinking = false;
+          this.buffer = this.buffer.substring(closeIdx + this.currentCloseTag.length);
+          continue;
+        }
+
+        let partialLen = 0;
+        const maxLen = Math.min(this.buffer.length, this.currentCloseTag.length - 1);
         for (let i = maxLen; i > 0; i--) {
-          if (targetTag.startsWith(this.buffer.substring(this.buffer.length - i))) {
+          if (this.currentCloseTag.startsWith(this.buffer.substring(this.buffer.length - i))) {
             partialLen = i;
             break;
           }
         }
-        const textBefore = this.buffer.substring(0, this.buffer.length - partialLen);
-        if (this.inThinking) {
-          reasoning += textBefore;
-        } else {
-          content += textBefore;
-        }
+
+        reasoning += this.buffer.substring(0, this.buffer.length - partialLen);
         this.buffer = this.buffer.substring(this.buffer.length - partialLen);
         break;
       }
@@ -90,11 +120,7 @@ class DelimiterParser {
 class StreamNormalizer {
   constructor(model) {
     this.model = model;
-    this.parser = null;
-    const tags = CONTENT_DELIMITER_TAGS[model];
-    if (tags) {
-      this.parser = new DelimiterParser(tags[0], tags[1]);
-    }
+    this.parser = new MultiDelimiterParser();
   }
 
   processDelta(delta) {
@@ -102,9 +128,12 @@ class StreamNormalizer {
     let reasoning = normalizedDelta.reasoning || normalizedDelta.reasoning_content || '';
     let content = normalizedDelta.content || '';
 
-    if (!reasoning && content && this.parser) {
+    // If content contains inline think tags, parse them out into reasoning cleanly
+    if (content) {
       const parsed = this.parser.processChunk(content);
-      reasoning = parsed.reasoning;
+      if (parsed.reasoning) {
+        reasoning = (reasoning || '') + parsed.reasoning;
+      }
       content = parsed.content;
     }
 
@@ -119,7 +148,6 @@ class StreamNormalizer {
   }
 
   flush() {
-    if (!this.parser) return { content: '', reasoning: '' };
     return this.parser.flush();
   }
 }
@@ -130,24 +158,26 @@ function normalizeNonStreamChoice(choice, model) {
   let reasoning = message.reasoning || message.reasoning_content || '';
   let content = message.content || '';
 
-  if (!reasoning && content) {
-    let parser = null;
-    const tags = CONTENT_DELIMITER_TAGS[model];
-    if (tags) {
-      parser = new DelimiterParser(tags[0], tags[1]);
-    }
-    if (parser) {
-      const parsed = parser.processChunk(content);
-      const flushed = parser.flush();
-      content = (parsed.content || '') + (flushed.content || '');
-      reasoning = (parsed.reasoning || '') + (flushed.reasoning || '');
+  if (content && (content.includes('<think>') || content.includes('<thought>') || content.includes('<mm:think>'))) {
+    const parser = new MultiDelimiterParser();
+    const parsed = parser.processChunk(content);
+    const flushed = parser.flush();
+    content = (parsed.content || '') + (flushed.content || '');
+    const extractedReasoning = (parsed.reasoning || '') + (flushed.reasoning || '');
+    if (extractedReasoning) {
+      reasoning = (reasoning ? reasoning + '\n' : '') + extractedReasoning;
     }
   }
 
   const newMessage = { ...message };
   if (content) newMessage.content = content;
-  if (reasoning) newMessage.reasoning = reasoning;
-  delete newMessage.reasoning_content;
+  if (reasoning) {
+    newMessage.reasoning = reasoning;
+    newMessage.reasoning_content = reasoning;
+  } else {
+    delete newMessage.reasoning;
+    delete newMessage.reasoning_content;
+  }
 
   return { ...choice, message: newMessage };
 }
