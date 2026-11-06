@@ -34,7 +34,7 @@ const AUTO_PREVENT_TRUNCATION = process.env.AUTO_PREVENT_TRUNCATION !== 'false';
 // Per-attempt timeout before falling back to the next model. Reasoning
 // models get a longer window since thinking delays first-token latency.
 // Check these against your platform's own request duration limit.
-const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 180000;
+const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 300000;
 const REASONING_REQUEST_TIMEOUT_MS = Number(process.env.REASONING_REQUEST_TIMEOUT_MS) || 480000;
 const VALIDATION_TIMEOUT_MS = 15000;
 const MAX_BUFFER_SIZE = 1024 * 1024; // 1MB
@@ -288,9 +288,6 @@ function setCooldown(model, ms) {
 
 async function callWithFallback(baseRequest, models, enableThinking, clientReasoningEffort, hasTools, abortSignal) {
   let lastError = null;
-  const timeoutMs = resolveEffectiveThinking(enableThinking, clientReasoningEffort)
-    ? REASONING_REQUEST_TIMEOUT_MS
-    : REQUEST_TIMEOUT_MS;
 
   // Skip cooling-down models; fall back to the full list if that empties the chain.
   const activeModels = models.filter(m => !isInCooldown(m));
@@ -302,11 +299,19 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
       throw new Error('Request aborted by client');
     }
 
+    const isModelReasoning = resolveEffectiveThinking(enableThinking, clientReasoningEffort) ||
+      model.includes('glm') ||
+      model.includes('deepseek') ||
+      model.includes('reasoning') ||
+      model.includes('kimi');
+
+    const attemptTimeoutMs = isModelReasoning ? REASONING_REQUEST_TIMEOUT_MS : REQUEST_TIMEOUT_MS;
+
     const reasoningPayload = getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTools);
     const fullRequest = { ...baseRequest, model, ...reasoningPayload };
 
     if (DEBUG_MODE) {
-      console.log(`[DEBUG] Attempting ${model} with reasoning payload:`, JSON.stringify(reasoningPayload), `(timeout: ${timeoutMs}ms)`);
+      console.log(`[DEBUG] Attempting ${model} with reasoning payload:`, JSON.stringify(reasoningPayload), `(timeout: ${attemptTimeoutMs}ms)`);
     }
 
     try {
@@ -319,7 +324,7 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
             'Content-Type': 'application/json'
           },
           responseType: baseRequest.stream ? 'stream' : 'json',
-          timeout: timeoutMs,
+          timeout: attemptTimeoutMs,
           signal: abortSignal
         }
       );

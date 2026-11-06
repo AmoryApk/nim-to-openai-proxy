@@ -260,14 +260,8 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
       }
 
       if (model.includes('glm')) {
-        if (!enableThinking) {
-          return { chat_template_kwargs: { thinking: false } };
-        }
-        return {
-          chat_template_kwargs: {
-            thinking: true
-          }
-        };
+        if (effort) return { reasoning_effort: effort };
+        return { reasoning_effort: enableThinking ? 'high' : 'low' };
       }
 
       if (model.includes('nemotron') && (model.includes('super') || model.includes('ultra') || model.includes('reasoning') || model.includes('nano'))) {
